@@ -1,0 +1,33 @@
+{
+  "indexes": [
+    {
+      "collectionGroup": "courses",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "deptId", "order": "ASCENDING" },
+        { "fieldPath": "yearNumber", "order": "ASCENDING" },
+        { "fieldPath": "session", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "pendingSyllabi",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "universityId", "order": "ASCENDING" },
+        { "fieldPath": "deptId", "order": "ASCENDING" },
+        { "fieldPath": "yearNumber", "order": "ASCENDING" },
+        { "fieldPath": "status", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "exercises",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "courseId", "order": "ASCENDING" },
+        { "fieldPath": "topicId", "order": "ASCENDING" },
+        { "fieldPath": "difficulty", "order": "ASCENDING" }
+      ]
+    }
+  ],
+  "fieldOverrides": []
+}

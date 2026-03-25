@@ -1,0 +1,16 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    // Pending uploads — authenticated users can upload to their dept path
+    match /pending-uploads/{uniId}/{deptId}/{allPaths=**} {
+      allow read: if request.auth != null;
+      allow write: if request.auth != null
+        && request.resource.size < 10 * 1024 * 1024; // 10MB limit
+    }
+
+    // All other paths — deny
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}

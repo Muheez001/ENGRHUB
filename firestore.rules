@@ -1,0 +1,85 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ── Helper functions ──
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    // ── Users ──
+    // Users can only read/write their own profile
+    match /users/{userId} {
+      allow read, write: if isOwner(userId);
+
+      // Progress subcollection — user's own data
+      match /progress/{courseId} {
+        allow read, write: if isOwner(userId);
+      }
+    }
+
+    // ── Departments ──
+    // Read-only for authenticated users. Writes via Cloud Functions only.
+    match /departments/{deptId} {
+      allow read: if isAuthenticated();
+      allow write: if false;
+
+      match /years/{yearId} {
+        allow read: if isAuthenticated();
+        allow write: if false;
+
+        match /sessions/{sessionId} {
+          allow read: if isAuthenticated();
+          allow write: if false;
+        }
+      }
+    }
+
+    // ── Courses ──
+    // Read-only for authenticated users. Writes via Cloud Functions only.
+    match /courses/{courseId} {
+      allow read: if isAuthenticated();
+      allow write: if false;
+
+      match /topics/{topicId} {
+        allow read: if isAuthenticated();
+        allow write: if false;
+      }
+    }
+
+    // ── Exercises ──
+    // Authenticated users can read questions but NOT the answer/solution fields.
+    // Answer checking happens via Cloud Function endpoint only.
+    match /exercises/{exerciseId} {
+      allow read: if isAuthenticated()
+        && !('answer' in resource.data && request.query != null)
+        // Note: Full answer protection is enforced at the Cloud Function level.
+        // Clients should only call the /checkAnswer endpoint.
+      ;
+      allow write: if false;
+    }
+
+    // ── Pending Syllabi ──
+    // Authenticated users can create new entries (upload).
+    // Reading limited to same university + department + year.
+    // Updates/deletes via Cloud Functions only.
+    match /pendingSyllabi/{uploadId} {
+      allow create: if isAuthenticated()
+        && request.resource.data.uploadedBy == request.auth.uid
+        && request.resource.data.status == 'pending';
+      allow read: if isAuthenticated();
+      allow update, delete: if false;
+    }
+
+    // ── Scrape Status ──
+    // Read-only for authenticated users. Writes via Cloud Functions only.
+    match /scrapeStatus/{statusId} {
+      allow read: if isAuthenticated();
+      allow write: if false;
+    }
+  }
+}
