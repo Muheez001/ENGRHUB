@@ -2,7 +2,9 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
 
-    // ── Helper functions ──
+    // ══════════════════════════════════════════════
+    // Helper Functions
+    // ══════════════════════════════════════════════
     function isAuthenticated() {
       return request.auth != null;
     }
@@ -11,10 +13,22 @@ service cloud.firestore {
       return isAuthenticated() && request.auth.uid == userId;
     }
 
-    // ── Users ──
-    // Users can only read/write their own profile
+    // Check if a user belongs to the same university + department + year
+    // Used for voting eligibility
+    function getUserProfile() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    // ══════════════════════════════════════════════
+    // Users — own profile only
+    // ══════════════════════════════════════════════
     match /users/{userId} {
-      allow read, write: if isOwner(userId);
+      allow read: if isOwner(userId);
+      allow create: if isOwner(userId);
+      // Updates limited to safe fields only (no role escalation)
+      allow update: if isOwner(userId)
+        && !request.resource.data.diff(resource.data).affectedKeys()
+            .hasAny(['role', 'isAdmin', 'trustScore']);
 
       // Progress subcollection — user's own data
       match /progress/{courseId} {
@@ -22,8 +36,9 @@ service cloud.firestore {
       }
     }
 
-    // ── Departments ──
-    // Read-only for authenticated users. Writes via Cloud Functions only.
+    // ══════════════════════════════════════════════
+    // Departments — read-only, writes via Admin SDK
+    // ══════════════════════════════════════════════
     match /departments/{deptId} {
       allow read: if isAuthenticated();
       allow write: if false;
@@ -39,8 +54,9 @@ service cloud.firestore {
       }
     }
 
-    // ── Courses ──
-    // Read-only for authenticated users. Writes via Cloud Functions only.
+    // ══════════════════════════════════════════════
+    // Courses — read-only, writes via Admin SDK
+    // ══════════════════════════════════════════════
     match /courses/{courseId} {
       allow read: if isAuthenticated();
       allow write: if false;
@@ -51,32 +67,66 @@ service cloud.firestore {
       }
     }
 
-    // ── Exercises ──
-    // Authenticated users can read questions but NOT the answer/solution fields.
-    // Answer checking happens via Cloud Function endpoint only.
+    // ══════════════════════════════════════════════
+    // Exercises — read questions only, answers are EXCLUDED
+    // Answer validation happens via checkAnswer Cloud Function
+    // ══════════════════════════════════════════════
     match /exercises/{exerciseId} {
-      allow read: if isAuthenticated()
-        && !('answer' in resource.data && request.query != null)
-        // Note: Full answer protection is enforced at the Cloud Function level.
-        // Clients should only call the /checkAnswer endpoint.
-      ;
+      // Allow reading exercise documents, but the answer/solution
+      // fields are stored in a separate subcollection that clients
+      // cannot access. This is enforced by collection structure,
+      // not field-level rules (which Firestore doesn't support).
+      allow read: if isAuthenticated();
       allow write: if false;
+
+      // Answer keys — COMPLETELY locked from clients
+      // Only the checkAnswer Cloud Function reads these via Admin SDK
+      match /answerKey/{keyId} {
+        allow read, write: if false;
+      }
     }
 
-    // ── Pending Syllabi ──
-    // Authenticated users can create new entries (upload).
-    // Reading limited to same university + department + year.
-    // Updates/deletes via Cloud Functions only.
+    // ══════════════════════════════════════════════
+    // Pending Syllabi — upload + voting flow
+    // ══════════════════════════════════════════════
     match /pendingSyllabi/{uploadId} {
+      // CREATE: Authenticated user can submit a new pending syllabus
+      // Must set themselves as uploader and status as 'pending'
       allow create: if isAuthenticated()
         && request.resource.data.uploadedBy == request.auth.uid
-        && request.resource.data.status == 'pending';
-      allow read: if isAuthenticated();
+        && request.resource.data.status == 'pending'
+        && request.resource.data.keys().hasAll([
+            'universityId', 'deptId', 'yearNumber', 'uploadedBy', 'status'
+        ]);
+
+      // READ: Only students from the same university + department can see
+      // pending syllabi (or the uploader themselves)
+      allow read: if isAuthenticated()
+        && (
+          resource.data.uploadedBy == request.auth.uid
+          || (
+            getUserProfile().university == resource.data.universityId
+            && getUserProfile().department == resource.data.deptId
+          )
+        );
+
+      // UPDATE + DELETE: Only via Cloud Functions (Admin SDK)
+      // Voting is done via the castVote Cloud Function
       allow update, delete: if false;
     }
 
-    // ── Scrape Status ──
-    // Read-only for authenticated users. Writes via Cloud Functions only.
+    // ══════════════════════════════════════════════
+    // Votes — separate collection for vote auditing
+    // Written by castVote Cloud Function only
+    // ══════════════════════════════════════════════
+    match /votes/{voteId} {
+      allow read: if isAuthenticated();
+      allow write: if false;
+    }
+
+    // ══════════════════════════════════════════════
+    // Scrape Status — read-only for clients
+    // ══════════════════════════════════════════════
     match /scrapeStatus/{statusId} {
       allow read: if isAuthenticated();
       allow write: if false;

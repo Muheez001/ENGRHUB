@@ -17,15 +17,27 @@ export const getSignedUrl = onCall(
             throw new HttpsError('unauthenticated', 'Must be logged in to access files.');
         }
 
-        const { filePath } = request.data;
+        const { filePath } = request.data || {};
 
-        if (!filePath) {
-            throw new HttpsError('invalid-argument', 'filePath is required.');
+        if (!filePath || typeof filePath !== 'string') {
+            throw new HttpsError('invalid-argument', 'filePath is required and must be a string.');
         }
 
         // Prevent path traversal attacks
         if (filePath.includes('..') || filePath.startsWith('/')) {
             throw new HttpsError('invalid-argument', 'Invalid file path.');
+        }
+
+        // Allowlist: only serve files from approved directories
+        const ALLOWED_PREFIXES = ['course-materials/', 'pending-uploads/'];
+        const isAllowed = ALLOWED_PREFIXES.some((prefix) =>
+            filePath.startsWith(prefix)
+        );
+        if (!isAllowed) {
+            throw new HttpsError(
+                'permission-denied',
+                'Access to this file path is not permitted.'
+            );
         }
 
         try {

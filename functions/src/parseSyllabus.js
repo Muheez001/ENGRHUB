@@ -1,31 +1,59 @@
-// Syllabus Parser — Storage trigger
+// Syllabus Parser — Storage trigger → Cloud Task worker
 // Fires when a file is uploaded to /pending-uploads/
 // Reads the file, calls Gemini 2.0 Flash to extract course data, writes to /pendingSyllabi
+//
+// Error Taxonomy:
+//   RATE_LIMITED  — Gemini 429 response, retried by Cloud Tasks
+//   INVALID_INPUT — File not readable or wrong format
+//   PARSE_FAILURE — Gemini returned non-JSON after retry
+//   API_DOWN      — Gemini API unreachable, retried by Cloud Tasks
+//   INTERNAL      — Unexpected error
 
 import { onObjectFinalized } from 'firebase-functions/v2/storage';
+import { onTaskDispatched } from 'firebase-functions/v2/tasks';
 import { getFirestore } from 'firebase-admin/firestore';
 import { getStorage } from 'firebase-admin/storage';
+import { getFunctions } from 'firebase-admin/functions';
 
-// Gemini API endpoint (free tier: 15 RPM)
-const GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent';
+// Gemini API endpoint (2.0 Flash — free tier: 15 RPM, 1500 RPD)
+const GEMINI_API_URL =
+    'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent';
 
-/**
- * Rate limit queue — 4s delay between Gemini calls (architecture rule #6)
- */
-let lastGeminiCall = 0;
-async function rateLimitedGeminiCall(apiKey, prompt) {
-    const now = Date.now();
-    const timeSinceLast = now - lastGeminiCall;
-    if (timeSinceLast < 4000) {
-        await new Promise((resolve) => setTimeout(resolve, 4000 - timeSinceLast));
+// ══════════════════════════════════════════════
+// Error Classes — enables retry vs no-retry decisions
+// ══════════════════════════════════════════════
+class RetryableError extends Error {
+    constructor(type, message) {
+        super(message);
+        this.name = 'RetryableError';
+        this.type = type;
     }
-    lastGeminiCall = Date.now();
+}
+
+class PermanentError extends Error {
+    constructor(type, message) {
+        super(message);
+        this.name = 'PermanentError';
+        this.type = type;
+    }
+}
+
+// ══════════════════════════════════════════════
+// Gemini API Client
+// ══════════════════════════════════════════════
+async function callGeminiAPI(apiKey, prompt, inlineData = null) {
+    const parts = [{ text: prompt }];
+    if (inlineData) {
+        parts.push({ inlineData });
+    }
+
+    const startTime = Date.now();
 
     const response = await fetch(`${GEMINI_API_URL}?key=${apiKey}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-            contents: [{ parts: [{ text: prompt }] }],
+            contents: [{ parts }],
             generationConfig: {
                 temperature: 0.1,
                 maxOutputTokens: 8192,
@@ -33,15 +61,79 @@ async function rateLimitedGeminiCall(apiKey, prompt) {
         }),
     });
 
+    const durationMs = Date.now() - startTime;
+
     if (!response.ok) {
-        throw new Error(`Gemini API error: ${response.status} ${response.statusText}`);
+        const errorText = await response.text();
+        const status = response.status;
+
+        // Rate limited — Cloud Tasks should retry
+        if (status === 429) {
+            throw new RetryableError(
+                'RATE_LIMITED',
+                `Gemini rate limited (429). Duration: ${durationMs}ms`
+            );
+        }
+
+        // Server error — transient, retry
+        if (status >= 500) {
+            throw new RetryableError(
+                'API_DOWN',
+                `Gemini server error (${status}). Duration: ${durationMs}ms. Details: ${errorText}`
+            );
+        }
+
+        // Client error — permanent, don't retry
+        throw new PermanentError(
+            'INVALID_INPUT',
+            `Gemini API error (${status}): ${errorText}`
+        );
     }
 
-    return response.json();
+    const result = await response.json();
+
+    console.log(
+        `📊 Gemini call completed: ${durationMs}ms, ` +
+        `tokens: ${result.usageMetadata?.totalTokenCount || 'unknown'}`
+    );
+
+    return result;
 }
 
+// ══════════════════════════════════════════════
+// Get Gemini API Key — supports Secret Manager + env fallback
+// ══════════════════════════════════════════════
+async function getGeminiApiKey() {
+    // Try GCP Secret Manager first (production)
+    try {
+        const { SecretManagerServiceClient } =
+            await import('@google-cloud/secret-manager');
+        const client = new SecretManagerServiceClient();
+        const [version] = await client.accessSecretVersion({
+            name: 'projects/-/secrets/GEMINI_API_KEY/versions/latest',
+        });
+        const key = version.payload.data.toString();
+        if (key) return key;
+    } catch {
+        // Secret Manager not available (emulator or not configured)
+    }
+
+    // Fallback to environment variable (emulator / development)
+    const envKey = process.env.GEMINI_API_KEY;
+    if (envKey) return envKey;
+
+    throw new PermanentError(
+        'INTERNAL',
+        'GEMINI_API_KEY not available in Secret Manager or environment'
+    );
+}
+
+// ══════════════════════════════════════════════
+// Storage Trigger — enqueue parse task
+// ══════════════════════════════════════════════
 /**
  * Triggered when a file is uploaded to Firebase Storage.
+ * Enqueues a durable Cloud Task to process parsing without memory or timeout loss.
  * Path pattern: pending-uploads/{uniId}/{deptId}/{filename}
  */
 export const parseSyllabus = onObjectFinalized(
@@ -59,26 +151,100 @@ export const parseSyllabus = onObjectFinalized(
             return;
         }
 
-        const [, uniId, deptId, filename] = parts;
-        const db = getFirestore();
+        const queue = getFunctions().taskQueue('parseSyllabusWorker');
+        await queue.enqueue({
+            filePath,
+            uniId: parts[1],
+            deptId: parts[2],
+            yearStr: parts[3],
+            uploadedBy: event.data.metadata?.uploadedBy || 'unknown',
+            fileSize: event.data.size || 0,
+            contentType: event.data.contentType || 'unknown',
+        });
 
-        // Get Gemini API key from environment
-        // In production: use GCP Secret Manager
-        // In emulator: set via .env or functions config
-        const apiKey = process.env.GEMINI_API_KEY;
-        if (!apiKey) {
-            console.error('❌ GEMINI_API_KEY not set');
-            return;
-        }
+        console.log(
+            `📥 Parse task enqueued: ${filePath} ` +
+            `(${Math.round((event.data.size || 0) / 1024)}KB, ${event.data.contentType})`
+        );
+    }
+);
+
+// ══════════════════════════════════════════════
+// Cloud Task Worker — Gemini parsing
+// ══════════════════════════════════════════════
+/**
+ * Worker: Parses the syllabus via Gemini 2.0 Flash.
+ * Uses Cloud Tasks rateLimits to strictly enforce max 1 concurrent dispatch
+ * to respect the free tier 15 RPM limits without failing.
+ *
+ * Error handling:
+ *   - RetryableError → rethrown so Cloud Tasks retries (rate limits, server errors)
+ *   - PermanentError → logged and written to Firestore as parse_failed (no retry)
+ */
+export const parseSyllabusWorker = onTaskDispatched(
+    {
+        region: 'us-central1',
+        retryConfig: {
+            maxAttempts: 5,
+            minBackoffSeconds: 10,
+            maxBackoffSeconds: 300,
+        },
+        rateLimits: { maxConcurrentDispatches: 1 },
+    },
+    async (request) => {
+        const { filePath, uniId, deptId, yearStr, uploadedBy, fileSize } =
+            request.data;
+        const db = getFirestore();
+        const startTime = Date.now();
+
+        console.log(
+            `🔄 Processing: ${filePath} | uni=${uniId} dept=${deptId} ` +
+            `year=${yearStr} size=${Math.round((fileSize || 0) / 1024)}KB`
+        );
+
+        // Get API key (Secret Manager → env fallback)
+        const apiKey = await getGeminiApiKey();
 
         try {
-            // Download the file content
+            // ── Download the file ──
             const bucket = getStorage().bucket();
             const file = bucket.file(filePath);
-            const [buffer] = await file.download();
-            const fileContent = buffer.toString('utf-8');
 
-            // Build the Gemini prompt
+            const [exists] = await file.exists();
+            if (!exists) {
+                throw new PermanentError(
+                    'INVALID_INPUT',
+                    `File not found: ${filePath}`
+                );
+            }
+
+            const [buffer] = await file.download();
+
+            // ── Prepare content for Gemini ──
+            const ext = filePath.split('.').pop().toLowerCase();
+            let inlineData = null;
+            let documentText = '';
+
+            const MIME_MAP = {
+                pdf: 'application/pdf',
+                docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+                pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+                doc: 'application/msword',
+                ppt: 'application/vnd.ms-powerpoint',
+            };
+
+            if (MIME_MAP[ext]) {
+                inlineData = {
+                    mimeType: MIME_MAP[ext],
+                    data: buffer.toString('base64'),
+                };
+                documentText = `[${ext.toUpperCase()} Document Attached — ${Math.round(buffer.length / 1024)}KB]`;
+            } else {
+                // Fallback to text reading
+                documentText = buffer.toString('utf-8').substring(0, 30000);
+            }
+
+            // ── Build prompt ──
             const prompt = `You are an academic syllabus parser. Extract course information from this document.
 
 Return a JSON object with this exact structure:
@@ -109,60 +275,66 @@ Rules:
 - If you cannot extract courses, return {"courses": []}
 
 Document content:
-${fileContent.substring(0, 30000)}`;
+${documentText}`;
 
-            console.log(`🔄 Parsing syllabus: ${filename} for ${uniId}/${deptId}`);
+            // ── Call Gemini (attempt 1) ──
+            const result = await callGeminiAPI(apiKey, prompt, inlineData);
+            const responseText =
+                result.candidates?.[0]?.content?.parts?.[0]?.text || '';
 
-            // Call Gemini
-            const result = await rateLimitedGeminiCall(apiKey, prompt);
-            const responseText = result.candidates?.[0]?.content?.parts?.[0]?.text || '';
-
-            // Try to parse the JSON response
+            // ── Parse JSON response ──
             let parsedJson;
             try {
-                // Remove markdown code fences if present
-                const cleaned = responseText.replace(/```json?\n?/g, '').replace(/```/g, '').trim();
+                const cleaned = responseText
+                    .replace(/```json?\n?/g, '')
+                    .replace(/```/g, '')
+                    .trim();
                 parsedJson = JSON.parse(cleaned);
             } catch {
-                // Retry with stricter prompt
-                console.log('⚠️ First parse failed, retrying with stricter prompt...');
+                // ── Retry with stricter prompt ──
+                console.log(
+                    '⚠️ First parse failed, retrying with stricter prompt...'
+                );
                 const retryPrompt = `${prompt}\n\nIMPORTANT: Your previous response was not valid JSON. Return ONLY a JSON object, starting with { and ending with }. No other text.`;
-                const retryResult = await rateLimitedGeminiCall(apiKey, retryPrompt);
-                const retryText = retryResult.candidates?.[0]?.content?.parts?.[0]?.text || '';
+                const retryResult = await callGeminiAPI(
+                    apiKey,
+                    retryPrompt,
+                    inlineData
+                );
+                const retryText =
+                    retryResult.candidates?.[0]?.content?.parts?.[0]?.text ||
+                    '';
 
                 try {
-                    const retryCleaned = retryText.replace(/```json?\n?/g, '').replace(/```/g, '').trim();
+                    const retryCleaned = retryText
+                        .replace(/```json?\n?/g, '')
+                        .replace(/```/g, '')
+                        .trim();
                     parsedJson = JSON.parse(retryCleaned);
                 } catch {
-                    // Both attempts failed
-                    console.error('❌ Parse failed after retry');
-                    await db.collection('pendingSyllabi').add({
-                        universityId: uniId,
-                        deptId,
-                        uploadedBy: event.data.metadata?.uploadedBy || 'unknown',
-                        fileUrl: filePath,
-                        parsedJson: null,
-                        status: 'parse_failed',
-                        confirmVotes: [],
-                        flagVotes: [],
-                        createdAt: new Date(),
-                        expiresAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
-                    });
-                    return;
+                    // Both attempts failed — permanent failure
+                    throw new PermanentError(
+                        'PARSE_FAILURE',
+                        'Gemini returned non-JSON after 2 attempts'
+                    );
                 }
             }
 
-            // Validate: must have courses array
+            // ── Validate structure ──
             if (!parsedJson.courses || !Array.isArray(parsedJson.courses)) {
                 parsedJson = { courses: [] };
             }
 
-            // Check for empty results (non-syllabus file)
+            // ── Determine year number ──
+            const yearNumber = parseInt(yearStr) || 1;
+
+            // ── Handle empty results ──
             if (parsedJson.courses.length === 0) {
                 await db.collection('pendingSyllabi').add({
                     universityId: uniId,
                     deptId,
-                    uploadedBy: event.data.metadata?.uploadedBy || 'unknown',
+                    yearNumber,
+                    uploadedBy,
                     fileUrl: filePath,
                     parsedJson,
                     status: 'rejected',
@@ -170,30 +342,83 @@ ${fileContent.substring(0, 30000)}`;
                     confirmVotes: [],
                     flagVotes: [],
                     createdAt: new Date(),
-                    expiresAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
+                    expiresAt: new Date(
+                        Date.now() + 30 * 24 * 60 * 60 * 1000
+                    ),
                 });
-                console.log('⚠️ No courses found — rejected');
+                console.log(
+                    `⚠️ No courses found — rejected. Duration: ${Date.now() - startTime}ms`
+                );
                 return;
             }
 
-            // Success — write to pendingSyllabi with status 'voting'
+            // ── Success — write to pendingSyllabi ──
             await db.collection('pendingSyllabi').add({
                 universityId: uniId,
                 deptId,
-                yearNumber: parseInt(parts[3]) || 1,
-                uploadedBy: event.data.metadata?.uploadedBy || 'unknown',
+                yearNumber,
+                uploadedBy,
                 fileUrl: filePath,
                 parsedJson,
                 status: 'voting',
                 confirmVotes: [],
                 flagVotes: [],
+                courseCount: parsedJson.courses.length,
                 createdAt: new Date(),
-                expiresAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000), // 30 days
+                expiresAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
             });
 
-            console.log(`✅ Syllabus parsed: ${parsedJson.courses.length} courses found, entering voting`);
+            console.log(
+                `✅ Syllabus parsed: ${parsedJson.courses.length} courses found. ` +
+                `Duration: ${Date.now() - startTime}ms. Entering voting.`
+            );
         } catch (error) {
-            console.error('❌ Syllabus parser error:', error);
+            const durationMs = Date.now() - startTime;
+
+            // Retryable errors — rethrow so Cloud Tasks retries
+            if (error instanceof RetryableError) {
+                console.warn(
+                    `⚠️ Retryable error (${error.type}): ${error.message}. Duration: ${durationMs}ms`
+                );
+                throw error; // Cloud Tasks will retry
+            }
+
+            // Permanent errors — log and write failure to Firestore
+            const errorType =
+                error instanceof PermanentError
+                    ? error.type
+                    : 'INTERNAL';
+
+            console.error(
+                `❌ Permanent error (${errorType}): ${error.message}. Duration: ${durationMs}ms`
+            );
+
+            // Write failure record so the user sees feedback
+            try {
+                const yearNumber = parseInt(yearStr) || 1;
+                await db.collection('pendingSyllabi').add({
+                    universityId: uniId,
+                    deptId,
+                    yearNumber,
+                    uploadedBy,
+                    fileUrl: filePath,
+                    parsedJson: null,
+                    status: 'parse_failed',
+                    errorType,
+                    errorMessage: error.message,
+                    confirmVotes: [],
+                    flagVotes: [],
+                    createdAt: new Date(),
+                    expiresAt: new Date(
+                        Date.now() + 30 * 24 * 60 * 60 * 1000
+                    ),
+                });
+            } catch (writeErr) {
+                console.error(
+                    '❌ Failed to write error record:',
+                    writeErr
+                );
+            }
         }
     }
 );

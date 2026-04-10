@@ -1,6 +1,7 @@
 // Answer Checker — HTTPS callable Cloud Function
 // Accepts { exerciseId, studentAnswer } → returns { correct, solution }
-// The answer/solution fields are NEVER sent to the client directly (architecture rule)
+// Answer keys stored in /exercises/{id}/answerKey/{keyId} — locked subcollection
+// Clients NEVER see raw answer data; only correct/incorrect + solution after attempt
 
 import { onCall, HttpsError } from 'firebase-functions/v2/https';
 import { getFirestore } from 'firebase-admin/firestore';
@@ -20,10 +21,25 @@ export const checkAnswer = onCall(
             throw new HttpsError('unauthenticated', 'Must be logged in to check answers.');
         }
 
-        const { exerciseId, studentAnswer } = request.data;
+        const { exerciseId, studentAnswer } = request.data || {};
 
-        if (!exerciseId || studentAnswer === undefined) {
-            throw new HttpsError('invalid-argument', 'exerciseId and studentAnswer are required.');
+        // ── Input validation ──
+        if (!exerciseId || typeof exerciseId !== 'string') {
+            throw new HttpsError('invalid-argument', 'exerciseId must be a non-empty string.');
+        }
+
+        // exerciseId format: alphanumeric + hyphens only
+        if (!/^[a-zA-Z0-9_-]+$/.test(exerciseId)) {
+            throw new HttpsError('invalid-argument', 'exerciseId contains invalid characters.');
+        }
+
+        if (studentAnswer === undefined || studentAnswer === null) {
+            throw new HttpsError('invalid-argument', 'studentAnswer is required.');
+        }
+
+        // Prevent absurdly long answers (DoS protection)
+        if (typeof studentAnswer === 'string' && studentAnswer.length > 1000) {
+            throw new HttpsError('invalid-argument', 'Answer too long (max 1000 characters).');
         }
 
         try {
@@ -36,8 +52,29 @@ export const checkAnswer = onCall(
             }
 
             const exercise = snap.data();
-            const correctAnswer = exercise.answer;
-            const solution = exercise.solution;
+
+            // Read answer from locked subcollection (not accessible by clients)
+            const answerSnap = await db
+                .collection(`exercises/${exerciseId}/answerKey`)
+                .limit(1)
+                .get();
+
+            let correctAnswer, solution;
+
+            if (!answerSnap.empty) {
+                // New pattern: answers in locked subcollection
+                const answerData = answerSnap.docs[0].data();
+                correctAnswer = answerData.answer;
+                solution = answerData.solution;
+            } else {
+                // Legacy fallback: answers stored directly on exercise doc
+                correctAnswer = exercise.answer;
+                solution = exercise.solution;
+            }
+
+            if (correctAnswer === undefined) {
+                throw new HttpsError('internal', 'Exercise answer not configured.');
+            }
 
             // Compare answers (case-insensitive for text, exact for numeric)
             let isCorrect = false;

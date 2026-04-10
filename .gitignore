@@ -17,6 +17,14 @@ build/
 .env.local
 .env.*.local
 functions/.env
+functions/.env.*
+
+# Service account keys and secrets
+*.pem
+*.key
+*-credentials.json
+service-account*.json
+firebase-adminsdk*.json
 
 # Editor directories and files
 .vscode/

@@ -6,9 +6,7 @@ import { getFirestore } from 'firebase-admin/firestore';
 import { getStorage } from 'firebase-admin/storage';
 
 // Initialize Firebase Admin (auto-configures in emulator + deployed environments)
-const app = initializeApp();
-export const db = getFirestore(app);
-export const storage = getStorage(app);
+initializeApp();
 
 // ── Cloud Functions ──
 // Each function is defined in its own file and re-exported here.
@@ -16,8 +14,11 @@ export const storage = getStorage(app);
 // User sync — creates Firestore profile on first Auth0 login
 export { userSync } from './src/userSync.js';
 
-// Syllabus parser — triggered on Storage upload, calls Gemini, writes to pendingSyllabi
-export { parseSyllabus } from './src/parseSyllabus.js';
+// Auth0 to Firebase bridge — mints custom Firebase tokens
+export { getCustomToken } from './src/getCustomToken.js';
+
+// Syllabus parser — triggered on Storage upload, calls Gemini
+export { parseSyllabus, parseSyllabusWorker } from './src/parseSyllabus.js';
 
 // Answer checker — HTTPS callable, validates student answers
 export { checkAnswer } from './src/checkAnswer.js';
@@ -27,6 +28,9 @@ export { getSignedUrl } from './src/getSignedUrl.js';
 
 // Gap score — Firestore trigger, recalculates gap score when topics change
 export { calculateGapScore } from './src/calculateGapScore.js';
+
+// Vote caster — HTTPS callable, secure voting with validation
+export { castVote } from './src/castVote.js';
 
 // Vote processor — Firestore trigger, auto-approves when 3 confirms reached
 export { processVote } from './src/processVote.js';

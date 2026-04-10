@@ -1,14 +1,53 @@
 rules_version = '2';
 service firebase.storage {
   match /b/{bucket}/o {
-    // Pending uploads — authenticated users can upload to their dept path
-    match /pending-uploads/{uniId}/{deptId}/{allPaths=**} {
+
+    // ── Default: deny all ──
+    // No open access. Every path must be explicitly allowed.
+
+    // ── Pending Uploads ──
+    // Students can upload syllabus files to their university/department path.
+    // Format: pending-uploads/{universityId}/{deptId}/{fileName}
+    match /pending-uploads/{universityId}/{deptId}/{fileName} {
+
+      // Anyone authenticated can READ files in known paths
+      // (needed for voting preview — voters must see the uploaded file)
       allow read: if request.auth != null;
-      allow write: if request.auth != null
-        && request.resource.size < 10 * 1024 * 1024; // 10MB limit
+
+      // Only authenticated users can CREATE (upload) files.
+      // Constraints:
+      //   - Max 10MB file size
+      //   - Only PDF, Word, or PPTX files
+      //   - Cannot overwrite existing files (use create, not update)
+      allow create: if request.auth != null
+        && request.resource.size < 10 * 1024 * 1024
+        && request.resource.contentType.matches('application/pdf|application/vnd.openxmlformats-officedocument.*|application/msword|application/vnd.ms-powerpoint');
+
+      // No client-side updates or deletes — only Cloud Functions with Admin SDK
+      allow update, delete: if false;
     }
 
-    // All other paths — deny
+    // ── Lecture Notes & Course Materials ──
+    // Read-only for authenticated users. Uploads via Admin SDK only.
+    // Format: course-materials/{courseId}/{fileName}
+    match /course-materials/{courseId}/{fileName} {
+      allow read: if request.auth != null;
+      allow write: if false;
+    }
+
+    // ── User Avatars ──
+    // Users can upload their own avatar only.
+    // Format: avatars/{userId}/{fileName}
+    match /avatars/{userId}/{fileName} {
+      allow read: if request.auth != null;
+      allow create, update: if request.auth != null
+        && request.auth.uid == userId
+        && request.resource.size < 2 * 1024 * 1024
+        && request.resource.contentType.matches('image/.*');
+      allow delete: if request.auth != null && request.auth.uid == userId;
+    }
+
+    // ── Catch-all: deny everything else ──
     match /{allPaths=**} {
       allow read, write: if false;
     }

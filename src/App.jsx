@@ -1,36 +1,37 @@
+import { lazy, Suspense } from 'react';
 import { BrowserRouter as Router, Routes, Route } from 'react-router-dom';
-import { useAuth0 } from '@auth0/auth0-react';
 import { ThemeProvider } from './context/ThemeContext';
-import { useUserProfile } from './hooks/useUserProfile';
+import { UserProvider, useUser } from './context/UserContext';
+import ErrorBoundary from './components/ErrorBoundary';
 import ProtectedRoute from './components/auth/ProtectedRoute';
 import OnboardingForm from './components/auth/OnboardingForm';
 import Sidebar from './components/Sidebar';
-import LoginPage from './pages/LoginPage';
-import Dashboard from './pages/Dashboard';
-import Courses from './pages/Courses';
-import CourseDetail from './pages/CourseDetail';
-import GapView from './pages/GapView';
-import Upload from './pages/Upload';
-import Voting from './pages/Voting';
-import Profile from './pages/Profile';
-import Settings from './pages/Settings';
+import StateDisplay from './components/StateDisplay';
+
+// ── Route-level code splitting ──
+// Pages are lazy-loaded to reduce initial bundle size.
+const LoginPage = lazy(() => import('./pages/LoginPage'));
+const Dashboard = lazy(() => import('./pages/Dashboard'));
+const Courses = lazy(() => import('./pages/Courses'));
+const CourseDetail = lazy(() => import('./pages/CourseDetail'));
+const GapView = lazy(() => import('./pages/GapView'));
+const Upload = lazy(() => import('./pages/Upload'));
+const Voting = lazy(() => import('./pages/Voting'));
+const Profile = lazy(() => import('./pages/Profile'));
+const Settings = lazy(() => import('./pages/Settings'));
+const Exercise = lazy(() => import('./pages/Exercise'));
 
 function AppLayout() {
-  const { hasProfile, loading, refetch } = useUserProfile();
+  const { hasProfile, profileLoading, refetchProfile } = useUser();
 
   // Show loading while checking Firestore for user profile
-  if (loading) {
-    return (
-      <div className="loading-screen">
-        <div className="loading-spinner"></div>
-        <p className="loading-text">Loading your profile...</p>
-      </div>
-    );
+  if (profileLoading) {
+    return <StateDisplay type="loading" message="Loading your profile..." />;
   }
 
   // First-time user — show onboarding form (no sidebar)
   if (!hasProfile) {
-    return <OnboardingForm onComplete={refetch} />;
+    return <OnboardingForm onComplete={refetchProfile} />;
   }
 
   // Existing user — show full app with sidebar
@@ -39,16 +40,19 @@ function AppLayout() {
       <Sidebar />
       <main className="main">
         <div className="content">
-          <Routes>
-            <Route path="/" element={<Dashboard />} />
-            <Route path="/courses" element={<Courses />} />
-            <Route path="/courses/:courseId" element={<CourseDetail />} />
-            <Route path="/gap-view" element={<GapView />} />
-            <Route path="/upload" element={<Upload />} />
-            <Route path="/voting" element={<Voting />} />
-            <Route path="/profile" element={<Profile />} />
-            <Route path="/settings" element={<Settings />} />
-          </Routes>
+          <Suspense fallback={<StateDisplay type="loading" message="Loading page..." />}>
+            <Routes>
+              <Route path="/" element={<Dashboard />} />
+              <Route path="/courses" element={<Courses />} />
+              <Route path="/courses/:courseId" element={<CourseDetail />} />
+              <Route path="/courses/:courseId/exercises" element={<Exercise />} />
+              <Route path="/gap-view" element={<GapView />} />
+              <Route path="/upload" element={<Upload />} />
+              <Route path="/voting" element={<Voting />} />
+              <Route path="/profile" element={<Profile />} />
+              <Route path="/settings" element={<Settings />} />
+            </Routes>
+          </Suspense>
         </div>
       </main>
     </>
@@ -57,24 +61,35 @@ function AppLayout() {
 
 function App() {
   return (
-    <ThemeProvider>
-      <Router>
-        <Routes>
-          {/* Public route — no sidebar, no protection */}
-          <Route path="/login" element={<LoginPage />} />
+    <ErrorBoundary>
+      <ThemeProvider>
+        <Router>
+          <Routes>
+            {/* Public route — no sidebar, no protection */}
+            <Route
+              path="/login"
+              element={
+                <Suspense fallback={<StateDisplay type="loading" />}>
+                  <LoginPage />
+                </Suspense>
+              }
+            />
 
-          {/* Protected routes — auth required, onboarding check */}
-          <Route
-            path="/*"
-            element={
-              <ProtectedRoute>
-                <AppLayout />
-              </ProtectedRoute>
-            }
-          />
-        </Routes>
-      </Router>
-    </ThemeProvider>
+            {/* Protected routes — auth required, onboarding check */}
+            <Route
+              path="/*"
+              element={
+                <ProtectedRoute>
+                  <UserProvider>
+                    <AppLayout />
+                  </UserProvider>
+                </ProtectedRoute>
+              }
+            />
+          </Routes>
+        </Router>
+      </ThemeProvider>
+    </ErrorBoundary>
   );
 }
 

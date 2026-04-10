@@ -32,12 +32,32 @@ export const processVote = onDocumentUpdated(
         const confirmVotes = after.confirmVotes || [];
         const flagVotes = after.flagVotes || [];
 
+        // ── Defense-in-depth: filter out uploader's own vote if it slipped through ──
+        const uploader = after.uploadedBy;
+        const validConfirms = confirmVotes.filter((uid) => uid !== uploader);
+        const validFlags = flagVotes.filter((uid) => uid !== uploader);
+
+        // If filtering changed anything, fix the document
+        if (
+            validConfirms.length !== confirmVotes.length ||
+            validFlags.length !== flagVotes.length
+        ) {
+            console.warn(
+                `⚠️ Self-vote detected on ${uploadId} by uploader ${uploader}. Removing.`
+            );
+            await db.doc(`pendingSyllabi/${uploadId}`).update({
+                confirmVotes: validConfirms,
+                flagVotes: validFlags,
+            });
+            return; // Will re-trigger this function with cleaned data
+        }
+
         console.log(
-            `🗳️ Vote update on ${uploadId}: ${confirmVotes.length} confirms, ${flagVotes.length} flags`
+            `🗳️ Vote update on ${uploadId}: ${validConfirms.length} confirms, ${validFlags.length} flags`
         );
 
         // ── AUTO-APPROVE: 3+ confirms, 0 flags ──
-        if (confirmVotes.length >= 3 && flagVotes.length === 0) {
+        if (validConfirms.length >= 3 && validFlags.length === 0) {
             console.log(`✅ Auto-approving syllabus ${uploadId}`);
 
             const batch = db.batch();

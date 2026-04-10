@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+        cache: 'npm'
+
+    - name: Install root dependencies
+      run: npm install
+
+    - name: Install functions dependencies
+      run: cd functions && npm install
+
+    - name: Run Functions Tests
+      run: cd functions && npm test
+
+    - name: Build frontend
+      run: npm run build
+      env:
+        # Mock environment variables needed for build
+        VITE_FIREBASE_API_KEY: "mock_key"
+        VITE_FIREBASE_PROJECT_ID: "mock_project"
+        VITE_FIREBASE_AUTH_DOMAIN: "mock_auth_domain"
+        VITE_FIREBASE_STORAGE_BUCKET: "mock_bucket"
+        VITE_FIREBASE_APP_ID: "mock_app_id"
+        VITE_FIREBASE_MESSAGING_SENDER_ID: "mock_sender"
